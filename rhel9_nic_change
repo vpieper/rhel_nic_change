@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# Ensure the script is run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root or using sudo."
+  exit 1
+fi
+
+# 1. Gather current network information
+echo "Available network interfaces:"
+ip -br link show | grep -v lo
+
+echo ""
+read -p "Enter the CURRENT interface name (e.g., ens33): " OLD_NAME
+read -p "Enter the NEW interface name (e.g., eth0): " NEW_NAME
+
+# Get MAC address for the chosen interface
+MAC_ADDR=$(ip link show "$OLD_NAME" | awk '/link\/ether/ {print $2}')
+
+if [ -z "$MAC_ADDR" ]; then
+    echo "Error: Could not find MAC address for interface $OLD_NAME"
+    exit 1
+fi
+
+echo -e "\nTarget Interface: $OLD_NAME"
+echo "MAC Address:      $MAC_ADDR"
+echo "New Name:         $NEW_NAME"
+read -p "Proceed with these settings? (y/n): " CONFIRM
+
+if [ "$CONFIRM" != "y" ]; then
+    echo "Aborted."
+    exit 1
+fi
+
+# 2. Create custom udev rule (This part stays the same as RHEL 8)
+UDEV_FILE="/etc/udev/rules.d/70-custom-net.rules"
+echo "Creating udev rule in $UDEV_FILE..."
+echo "SUBSYSTEM==\"net\", ACTION==\"add\", DRIVERS==\"?*\", ATTR{address}==\"$MAC_ADDR\", NAME=\"$NEW_NAME\"" > "$UDEV_FILE"
+
+# 3. Update NetworkManager using RHEL 9 Native nmcli
+echo "Updating NetworkManager Profile using nmcli..."
+# Check if a connection profile exists with the old name
+if nmcli connection show "$OLD_NAME" &>/dev/null; then
+    # Rename the profile profile and re-bind it to the new hardware interface name
+    nmcli connection modify "$OLD_NAME" connection.interface-name "$NEW_NAME"
+    nmcli connection modify "$OLD_NAME" connection.id "$NEW_NAME"
+else
+    echo "Warning: No NetworkManager connection named '$OLD_NAME' found."
+    echo "Creating a new clean connection profile for $NEW_NAME..."
+    nmcli connection add type ethernet con-name "$NEW_NAME" ifname "$NEW_NAME"
+fi
+
+echo -e "\nConfiguration complete! A system reboot is required to apply the changes safely."
+read -p "Reboot now? (y/n): " REBOOT_NOW
+if [ "$REBOOT_NOW" = "y" ]; then
+    reboot
+fi
