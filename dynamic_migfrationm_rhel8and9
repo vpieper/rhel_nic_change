@@ -1,0 +1,66 @@
+#!/bin/bash
+# Hyper-V Migration Network Repair Script (RHEL 8 & RHEL 9)
+
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root."
+  exit 1
+fi
+
+echo "Cleaning up old VMware network configurations..."
+
+# 1. Clear any old udev rules inherited from VMware
+rm -f /etc/udev/rules.d/70-custom-net.rules
+rm -f /etc/systemd/network/*.link
+
+# 2. Identify the new Hyper-V interface name and its MAC
+NEW_IFACE=$(ip -br link show | grep -v lo | awk '{print $1}' | head -n 1)
+NEW_MAC=$(ip link show "$NEW_IFACE" | awk '/link\/ether/ {print $2}')
+
+if [ -z "$NEW_IFACE" ]; then
+    echo "Error: No network interface detected under Hyper-V!"
+    exit 1
+fi
+
+echo "Detected new Hyper-V interface: $NEW_IFACE ($NEW_MAC)"
+
+# 3. Handle RHEL 8 (Legacy ifcfg files)
+if [ -d "/etc/sysconfig/network-scripts" ]; then
+    # Move the first available old VMware config to match the new interface name
+    OLD_CFG=$(ls /etc/sysconfig/network-scripts/ifcfg-* | grep -v ifcfg-lo | head -n 1)
+    
+    if [ -f "$OLD_CFG" ]; then
+        NEW_CFG="/etc/sysconfig/network-scripts/ifcfg-$NEW_IFACE"
+        echo "Migrating RHEL 8 config profile to $NEW_CFG..."
+        mv "$OLD_CFG" "$NEW_CFG"
+        
+        # Strip old hardware IDs and inject the new ones
+        sed -i '/^DEVICE=/d' "$NEW_CFG"
+        sed -i '/^NAME=/d' "$NEW_CFG"
+        sed -i '/^HWADDR=/d' "$NEW_CFG"
+        
+        echo "DEVICE=$NEW_IFACE" >> "$NEW_CFG"
+        echo "NAME=$NEW_IFACE" >> "$NEW_CFG"
+        echo "HWADDR=$NEW_MAC" >> "$NEW_CFG"
+    fi
+fi
+
+# 4. Handle RHEL 9 (Modern NetworkManager keyfiles)
+# This clears out dead connection bindings and tells NM to adapt to the new hardware
+nmcli connection reload
+
+# Find the old connection profile name (often named after the old interface)
+OLD_CONN=$(nmcli -t -f NAME,DEVICE connection show | grep -v "lo" | head -n 1 | cut -d: -f1)
+
+if [ ! -z "$OLD_CONN" ]; then
+    echo "Updating NetworkManager profile '$OLD_CONN' for RHEL 9..."
+    nmcli connection modify "$OLD_CONN" connection.interface-name "$NEW_IFACE"
+    nmcli connection modify "$OLD_CONN" connection.id "$NEW_IFACE"
+fi
+
+# 5. Restart network services to apply
+echo "Restarting NetworkManager..."
+systemctl restart NetworkManager
+nmcli connection up "$NEW_IFACE" 2>/dev/null
+
+echo "Network migration complete!"
+ip a show "$NEW_IFACE"
